@@ -2,6 +2,27 @@
 
 All notable changes to the public builds. Versions follow semantic versioning.
 
+## 1.3.3 — 2026-09-22
+
+- Hardening: the installed app ignores Chromium's remote-debugging switches (`--remote-debugging-port`, `--remote-debugging-pipe`, `--remote-debugging-address`), so it can no longer be started with the DevTools protocol open; the ignored switch is noted in the log. Development runs (`electron .`) are unchanged. Defence in depth — starting the app with arguments already requires access to the Windows account.
+
+## 1.3.5 — 2026-09-22
+
+- Fixed: a StreamElements tip in euro (or GBP, AED, TRY, CAD, CHF and other common currencies) showed only "5 EUR" and matched no tier, so no file played. The rates baha24/bonbast publish next to the dollar are now stored with the dollar rate; such tips are converted to toman, use the same tiers, and the card shows for example "5 EUR = 1,338,900 تومان". A currency without a published rate is still shown as amount + code.
+- Fixed: the "طلایی کلاسیک" preset wrote "{name} tip {amount}"; it now reads "{name} tipped {amount}" (existing custom templates are not changed).
+
+## 1.3.4 — 2026-09-22
+
+- New: **StreamElements tips**. Paste the JWT token of your StreamElements account in Settings and tips from your StreamElements tipping page enter the same queue as KickBot donations, with the same files and tiers. The token is stored encrypted like the KickBot key, never shown or logged, and removed with one click. Tips in a currency other than USD are shown with their amount and currency code (no toman conversion). New network destinations are documented in PRIVACY.md and docs/DATA_FLOW.md.
+
+## 1.3.2 — 2026-09-21
+
+- Security (reported by [KernelDotDLL](https://github.com/KernelDotDLL), thank you): a page on another website that the streamer had open could connect to the alert event stream. It could not read anything, but the connection alone counted as a Browser Source, so an alert could be consumed while OBS was closed, and the number of connections was unbounded. The event stream now refuses requests from another site and caps the number of connections per role.
+- Security (same report): `/media/…` served every file in the media folder, including notes or a partial upload. Only files registered as alerts are served now.
+- Fixed: the first-run setup card on the Home page had no gap below it (first outside contribution, thanks [TikTaak](https://github.com/TikTaak)).
+- Project: bilingual issue forms for bug reports, problems with outside services and feature requests, with a warning not to post the KickBot widget key or donor names (thanks [shahriaarrr](https://github.com/shahriaarrr)).
+- Fixed: in the file editor the header icon was oversized and the preview collapsed to a thin strip when the window was short (present since 1.0, more visible since 1.3.1 added a field). The panel now scrolls instead of squashing its parts.
+
 ## 1.3.1 — 2026-09-19
 
 - Kick subscriptions behind a filter: Sahne+ now uses the Windows system proxy automatically (for example v2rayN or another VPN app in "system proxy" mode) for kick.com and bonbast.com — after a manually entered proxy and before a direct connection. Only plain HTTP proxies are used; a SOCKS-only setup needs the VPN's TUN mode or a manual HTTP proxy. The detected proxy is shown under the proxy field in Settings.

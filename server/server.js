@@ -28,6 +28,7 @@ const LIMITS = {
   fileName: 120,
   upload: 512 * 1024 * 1024,
   files: 500,
+  sse: { overlay: 8, preview: 4, admin: 4 }, // concurrent event streams per role
   played: 1000,
   logs: 300,
   minRateInterval: 1,
@@ -82,7 +83,7 @@ const DEFAULT_CONFIG = {
   },
   files: [],
   showAlertWithoutMedia: true,
-  rate: { auto: true, manual: null, value: null, updatedAt: null, source: null, intervalMin: 2, proxy: '' },
+  rate: { auto: true, manual: null, value: null, updatedAt: null, source: null, intervalMin: 2, proxy: '', fx: {} },
   kick: {
     enabled: true,
     channel: '',
@@ -93,6 +94,7 @@ const DEFAULT_CONFIG = {
     subValueToman: 0,
     showNewSubs: true
   },
+  se: { channelId: null, username: null, provider: null }, // StreamElements account (the JWT token is stored separately, encrypted)
   app: { autostart: true, updateCheck: true, updateNotifiedFor: null }
 };
 const FONTS = ['Vazirmatn', 'Estedad', 'Lalezar', 'Inter', 'Poppins', 'Segoe UI', 'Tahoma'];
@@ -228,6 +230,100 @@ function httpsUrl(u) {
     return null;
   }
 }
+// StreamElements "channel.activities" message -> a queue entry, or null when it is not a tip we can use.
+// Tips are already paid on StreamElements' side, so they enter the queue like local events (no capture step).
+function parseSeActivity(a) {
+  if (!a || typeof a !== 'object') return null;
+  if (String(a.type || '').toLowerCase() !== 'tip') return null; // subs/follows: not used (subs come from Kick chat)
+  const d = a.data && typeof a.data === 'object' ? a.data : {};
+  const idRaw = String(a._id || d.tipId || '')
+    .replace(/[^A-Za-z0-9_-]/g, '')
+    .slice(0, 64);
+  if (!idRaw) return null;
+  const amount = finite(d.amount, 0, 1e9, 0);
+  const currency = /^[A-Za-z]{3}$/.test(String(d.currency || '')) ? String(d.currency).toUpperCase() : 'USD';
+  return {
+    stripe_pi_id: 'se_' + idRaw,
+    tipper_name: cleanText(d.displayName || d.username || d.name, LIMITS.name) || 'ناشناس',
+    tip_message: cleanText(d.message, LIMITS.message),
+    amount_total: Math.round(amount * 100),
+    currency,
+    approval_status: 'approved',
+    is_local: true,
+    is_test: !!(a.isMock || a.mock || d.isMock || a.test || d.test),
+    kind: 'tip',
+    count: null,
+    tags: [],
+    toman_override: null,
+    source: 'streamelements',
+    created_at: typeof a.createdAt === 'string' ? a.createdAt : new Date().toISOString()
+  };
+}
+// a StreamElements JWT: three base64url parts, second part decodes to JSON with a channel id
+function seTokenOk(t) {
+  const s = String(t || '').trim();
+  if (s.length < 40 || s.length > 4000 || !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(s)) return false;
+  try {
+    const p = JSON.parse(Buffer.from(s.split('.')[1], 'base64url').toString('utf8'));
+    return !!(p && typeof p === 'object');
+  } catch {
+    return false;
+  }
+}
+
+// Other currencies a StreamElements tipping page may use, converted to toman with the sell rates that baha24
+// (and bonbast as fallback) publish next to the dollar. Anything else is shown as "5 XYZ" without conversion.
+const FX_CODES = [
+  'EUR',
+  'GBP',
+  'AED',
+  'TRY',
+  'CAD',
+  'CHF',
+  'RUB',
+  'CNY',
+  'INR',
+  'SGD',
+  'NOK',
+  'SEK',
+  'DKK',
+  'AUD',
+  'THB',
+  'KWD',
+  'MYR',
+  'OMR',
+  'JPY',
+  'AZN',
+  'AFN'
+];
+function sanitizeFx(fx) {
+  const o = {};
+  if (fx && typeof fx === 'object')
+    for (const c of FX_CODES) {
+      const v = Number(fx[c]);
+      if (Number.isFinite(v) && v >= 10 && v <= 1e9) o[c] = Math.round(v);
+    }
+  return o;
+}
+function fxFromBaha24(list) {
+  const fx = {};
+  for (const x of Array.isArray(list) ? list : []) {
+    const sym = x && String(x.symbol || '').toUpperCase();
+    if (!FX_CODES.includes(sym)) continue;
+    const v = Number(String(x.sell).replace(/,/g, ''));
+    if (Number.isFinite(v) && v >= 10 && v <= 1e9) fx[sym] = Math.round(v);
+  }
+  return fx;
+}
+function fxFromBonbast(j) {
+  const fx = {};
+  for (const c of FX_CODES) {
+    const v = Number(String((j && j[c.toLowerCase() + '1']) || '').replace(/,/g, ''));
+    if (Number.isFinite(v) && v >= 10 && v <= 1e9) fx[c] = Math.round(v);
+  }
+  return fx;
+}
+
 // ---------- network helpers (pure, unit-tested) ----------
 // Failures of the kind a filtered site produces in Iran: reset / refused / timeout / DNS / TLS handshake cut.
 const NET_CODES = new Set([
@@ -353,6 +449,7 @@ function createServer(opts) {
   // ---------- config ----------
   // The KickBot secret never lives in `config` (and therefore never in config.json in plaintext when the OS store is available).
   let secret = ''; // in-memory only
+  let seToken = ''; // StreamElements JWT, in-memory only
   let secretStorage = 'none'; // 'os' (DPAPI via Electron safeStorage) | 'plain' (fallback) | 'none'
   let config = loadConfig();
   function loadConfig() {
@@ -377,6 +474,7 @@ function createServer(opts) {
       appearance: { ...DEFAULT_CONFIG.appearance, ...(c.appearance || {}) },
       rate: { ...DEFAULT_CONFIG.rate, ...(c.rate || {}) },
       kick: { ...DEFAULT_CONFIG.kick, ...(c.kick || {}) },
+      se: { ...DEFAULT_CONFIG.se, ...(c.se || {}) },
       app: { ...DEFAULT_CONFIG.app, ...(c.app || {}) }
     };
     merged.app.updateCheck = merged.app.updateCheck !== false;
@@ -396,12 +494,24 @@ function createServer(opts) {
     } else secretStorage = store && store.available() ? 'os' : 'plain';
     delete merged.secret_id;
     delete merged.secret_id_enc;
+    if (c.se_token_enc && store && store.available()) {
+      try {
+        seToken = String(store.decrypt(c.se_token_enc) || '');
+      } catch {
+        seToken = '';
+      }
+    } else if (typeof c.se_token === 'string' && c.se_token) seToken = c.se_token;
+    if (!seTokenOk(seToken)) seToken = '';
+    delete merged.se_token;
+    delete merged.se_token_enc;
+    if (!/^[A-Za-z0-9]{1,64}$/.test(String(merged.se.channelId || ''))) merged.se.channelId = null;
     if (!Array.isArray(merged.files)) merged.files = [];
     merged.files = merged.files.map(sanitizeFile).filter(Boolean).slice(0, LIMITS.files);
     if (merged.rate.proxy == null)
       merged.rate.proxy =
         process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy || '';
     merged.rate.intervalMin = Math.max(LIMITS.minRateInterval, Number(merged.rate.intervalMin) || 2);
+    merged.rate.fx = sanitizeFx(merged.rate.fx);
     merged.port = finite(merged.port, 1024, 65535, 7788);
     if (!ENUMS.mode.includes(merged.mode)) merged.mode = 'standalone';
     return merged;
@@ -422,6 +532,18 @@ function createServer(opts) {
         secretStorage = 'plain';
       }
     }
+    if (seToken) {
+      let enc = null;
+      if (store && store.available()) {
+        try {
+          enc = store.encrypt(seToken);
+        } catch {
+          enc = null;
+        }
+      }
+      if (enc) out.se_token_enc = enc;
+      else out.se_token = seToken;
+    }
     return out;
   }
   function saveConfig() {
@@ -437,7 +559,13 @@ function createServer(opts) {
   function publicConfig() {
     return {
       ...config,
-      kickbot: { configured: !!(secret && config.streamer_id), streamer_id: config.streamer_id, secretStorage }
+      kickbot: { configured: !!(secret && config.streamer_id), streamer_id: config.streamer_id, secretStorage },
+      streamelements: {
+        configured: !!(seToken && config.se.channelId),
+        username: config.se.username,
+        provider: config.se.provider,
+        secretStorage
+      }
     };
   }
   if (!fs.existsSync(CFG_PATH)) saveConfig();
@@ -541,7 +669,9 @@ function createServer(opts) {
     try {
       return JSON.parse(
         JSON.stringify(v, (k, val) =>
-          k === 'secret_id' || k === 'authorization' || k === 'secret_id_enc' ? '[redacted]' : val
+          ['secret_id', 'authorization', 'secret_id_enc', 'se_token', 'se_token_enc', 'token'].includes(k)
+            ? '[redacted]'
+            : val
         )
       );
     } catch {
@@ -600,6 +730,7 @@ function createServer(opts) {
         error: kickState.error,
         hint: kickState.hint
       },
+      se: sePublic(),
       rate: currentRate(),
       rateUpdatedAt: config.rate.updatedAt,
       rateManual: Number(config.rate.manual) > 0,
@@ -949,7 +1080,8 @@ function createServer(opts) {
 
   // ---------- USD -> Toman rate: baha24 public JSON API first, bonbast.com (scraped) as fallback. Never silently trusted. ----------
   let rateError = null,
-    lastBonbastAttempt = 0;
+    lastBonbastAttempt = 0,
+    lastFx = null;
   async function fetchBaha24() {
     const attempt = async px => {
       const r = await httpsRequest(
@@ -966,6 +1098,7 @@ function createServer(opts) {
       }
       const list = Array.isArray(j) ? j : j && Array.isArray(j.data) ? j.data : null;
       const usd = list ? list.find(x => x && String(x.symbol).toUpperCase() === 'USD') : null;
+      lastFx = fxFromBaha24(list);
       if (!usd) throw new Error('baha24: USD not in response');
       const v = Number(String(usd.sell).replace(/,/g, ''));
       if (!Number.isFinite(v) || v < 1000 || v > 1e9)
@@ -1019,6 +1152,7 @@ function createServer(opts) {
       const v = Number(String(j.usd1 || '').replace(/,/g, ''));
       if (!Number.isFinite(v) || v < 1000 || v > 1e9)
         throw new Error('bonbast usd1 out of range: ' + String(j.usd1).slice(0, 20));
+      lastFx = fxFromBonbast(j);
       return Math.round(v);
     };
     const order = await routesFor(BONBAST, false); // bonbast is filtered in Iran: proxies first, direct last
@@ -1061,6 +1195,7 @@ function createServer(opts) {
       config.rate.value = v;
       config.rate.updatedAt = new Date().toISOString();
       config.rate.source = source;
+      if (lastFx && Object.keys(lastFx).length) config.rate.fx = lastFx; // other currencies from the same answer
       rateError = null;
       saveConfig();
       if (changed) log('info', 'نرخ دلار به‌روز شد (' + source + ')', { toman: v });
@@ -1353,6 +1488,153 @@ function createServer(opts) {
     sendState();
     return false;
   }
+  // ---------- StreamElements: tips from the streamer's own SE tipping page. Same shape as the KickBot link: one
+  // token, one websocket, tips enter the queue. Tips are already paid on SE's side, so there is no capture call. ----------
+  const SE_WS = 'wss://astro.streamelements.com';
+  const SE_ME = 'https://api.streamelements.com/kappa/v2/channels/me';
+  let sews = null,
+    seReconnectTimer = null,
+    seReconnectToken = '',
+    seSubscribed = false,
+    seError = null;
+  const seConfigured = () => !!(seToken && config.se.channelId);
+  function seStatus() {
+    if (!seConfigured()) return 'unconfigured';
+    if (seError) return 'error';
+    if (sews && sews.readyState === 1 && seSubscribed) return 'connected';
+    if (sews && (sews.readyState === 0 || sews.readyState === 1)) return 'connecting';
+    return 'reconnecting';
+  }
+  function sePublic() {
+    return {
+      configured: seConfigured(),
+      status: seStatus(),
+      username: config.se.username,
+      provider: config.se.provider,
+      error: seError
+    };
+  }
+  function seScheduleReconnect(ms) {
+    clearTimeout(seReconnectTimer);
+    if (!stopped && seConfigured()) seReconnectTimer = setTimeout(seConnect, ms || 5000);
+  }
+  function seConnect() {
+    if (stopped || !NODE_OK || !seConfigured()) return;
+    if (sews && (sews.readyState === 0 || sews.readyState === 1)) return;
+    seSubscribed = false;
+    let sock;
+    try {
+      sock = new WebSocket(
+        seReconnectToken ? SE_WS + '/?reconnect_token=' + encodeURIComponent(seReconnectToken) : SE_WS
+      );
+    } catch (e) {
+      log('error', 'StreamElements: WebSocket create failed', e.message);
+      return seScheduleReconnect();
+    }
+    sews = sock;
+    const connTimeout = setTimeout(() => {
+      if (sock.readyState === 0) {
+        try {
+          sock.close();
+        } catch {}
+      }
+    }, 15000);
+    sock.onopen = () => clearTimeout(connTimeout);
+    sock.onmessage = ev => {
+      let m;
+      try {
+        m = JSON.parse(ev.data);
+      } catch {
+        return;
+      }
+      if (!m || typeof m !== 'object') return;
+      if (m.type === 'welcome') {
+        seReconnectToken = '';
+        sock.send(
+          JSON.stringify({
+            type: 'subscribe',
+            nonce: crypto.randomUUID(),
+            data: { topic: 'channel.activities', room: config.se.channelId, token: seToken, token_type: 'jwt' }
+          })
+        );
+      } else if (m.type === 'response') {
+        if (m.error) {
+          const msg = String((m.data && m.data.message) || m.error).slice(0, 160);
+          seError = /unauth|signature|expired|invalid/i.test(msg)
+            ? 'توکن StreamElements پذیرفته نشد؛ توکن جدید از داشبورد بگیرید و دوباره وارد کنید'
+            : 'StreamElements: ' + msg;
+          log('warn', 'StreamElements: اشتراک ناموفق بود', { error: String(m.error).slice(0, 60), message: msg });
+          try {
+            sock.close(); // a rejected token: close and retry only occasionally (the user may paste a new token)
+          } catch {}
+          clearTimeout(seReconnectTimer);
+          seReconnectTimer = setTimeout(seConnect, 5 * 60 * 1000);
+        } else {
+          seSubscribed = true;
+          seError = null;
+          log('info', 'به StreamElements وصل شد', { username: config.se.username, provider: config.se.provider });
+        }
+        sendState();
+      } else if (m.type === 'reconnect') {
+        seReconnectToken = String((m.data && m.data.token) || m.token || '');
+        try {
+          sock.close();
+        } catch {}
+      } else if (m.type === 'message' && String(m.topic || '') === 'channel.activities') {
+        handleSeActivity(m.data);
+      }
+    };
+    sock.onerror = () => {};
+    sock.onclose = ev => {
+      clearTimeout(connTimeout);
+      if (sews === sock) sews = null;
+      const was = seSubscribed;
+      seSubscribed = false;
+      if (was && seConfigured() && !stopped) log('warn', 'اتصال StreamElements قطع شد، تلاش مجدد', { code: ev.code });
+      sendState();
+      if (!seError) seScheduleReconnect(seReconnectToken ? 500 : 5000);
+    };
+  }
+  timers.push(
+    setInterval(() => {
+      if (seConfigured() && !seError && (!sews || sews.readyState === 3)) seConnect();
+    }, 10000)
+  );
+  function handleSeActivity(a) {
+    const t = parseSeActivity(a);
+    if (!t) {
+      if (a && a.type) log('info', 'StreamElements: رویداد نادیده گرفته شد', { type: String(a.type).slice(0, 30) });
+      return;
+    }
+    if (
+      playedIds.has(t.stripe_pi_id) ||
+      approved.some(x => x.stripe_pi_id === t.stripe_pi_id) ||
+      (playing && playing.stripe_pi_id === t.stripe_pi_id)
+    )
+      return;
+    log('info', 'دونیت StreamElements', tipSummary(t));
+    if (config.mode === 'companion') showTip(t);
+    else {
+      approved.push(t);
+      tryNext();
+    }
+    sendState();
+  }
+  function seDisconnect() {
+    seToken = '';
+    config.se = { ...DEFAULT_CONFIG.se };
+    seReconnectToken = '';
+    seError = null;
+    seSubscribed = false;
+    clearTimeout(seReconnectTimer);
+    if (sews) {
+      try {
+        sews.close();
+      } catch {}
+      sews = null;
+    }
+  }
+
   function kickConnect() {
     if (!NODE_OK || !config.kick.enabled || !config.kick.chatroomId) return;
     if (kws && (kws.readyState === 0 || kws.readyState === 1)) return;
@@ -1487,11 +1769,24 @@ function createServer(opts) {
   }
 
   // ---------- queue / playback ----------
+  // toman per unit of a currency: USD from the rate card (manual or fetched), others from the fetched fx table
+  function fxRate(code) {
+    if (!code || code === 'USD') return currentRate();
+    const v = config.rate.fx && config.rate.fx[code];
+    return Number.isFinite(v) && v > 0 ? v : null;
+  }
+  function tomanFor(t) {
+    if (t.toman_override != null) return t.toman_override;
+    const r = fxRate(t.currency || 'USD');
+    return r ? Math.round(((t.amount_total || 0) / 100) * r) : null;
+  }
   function tipSummary(t) {
     return {
       id: t.stripe_pi_id,
       name: t.tipper_name,
       amount: (t.amount_total || 0) / 100,
+      currency: t.currency || 'USD',
+      source: t.source || (t.is_local ? 'kick' : 'kickbot'),
       message: t.tip_message,
       test: !!t.is_test,
       kind: t.kind || 'tip',
@@ -1574,7 +1869,7 @@ function createServer(opts) {
       log('info', 'آلرت بدون فایل نمایش داده نشد (طبق تنظیمات)', tipSummary(t));
       recent.unshift({
         ...tipSummary(t),
-        toman: t.toman_override != null ? t.toman_override : tomanOf((t.amount_total || 0) / 100),
+        toman: tomanFor(t),
         media: null,
         skipped: true,
         at: Date.now()
@@ -1617,7 +1912,8 @@ function createServer(opts) {
       id: t.stripe_pi_id,
       name: cleanText(t.tipper_name, LIMITS.name) || 'ناشناس',
       amount: (t.amount_total || 0) / 100,
-      toman: t.toman_override != null ? t.toman_override : tomanOf((t.amount_total || 0) / 100),
+      currency: t.currency || 'USD',
+      toman: tomanFor(t),
       rate: currentRate(),
       kind: t.kind || 'tip',
       count: t.count || null,
@@ -1638,9 +1934,11 @@ function createServer(opts) {
     };
   }
   function pickMedia(t) {
-    const usd = (t.amount_total || 0) / 100;
     const rate = currentRate();
-    const toman = t.toman_override != null ? Number(t.toman_override) : rate ? usd * rate : null;
+    const toman = t.toman_override != null ? Number(t.toman_override) : tomanFor(t); // any currency with a known rate
+    // dollar-based tiers (minAmount) see the dollar equivalent; a currency without a rate matches keyword files only
+    const usd =
+      t.currency && t.currency !== 'USD' ? (toman != null && rate ? toman / rate : 0) : (t.amount_total || 0) / 100;
     const msg = normFa(t.tip_message);
     const tags = (t.tags || []).map(x => normFa(x));
     const files = config.files.filter(f => f.enabled !== false && fs.existsSync(path.join(MEDIA, f.file)));
@@ -1812,12 +2110,33 @@ function createServer(opts) {
       if (p === '/overlay') return serveFile(req, res, path.join(PUB, 'overlay.html'), CSP_OVERLAY);
       if (STATIC.test(p) || p.startsWith('/fonts/') || p.startsWith('/brand/') || p.startsWith('/legal/'))
         return servePublic(req, res, decodeURIComponent(url.pathname.slice(1)));
-      if (p.startsWith('/media/'))
-        return serveFile(req, res, path.join(MEDIA, path.basename(decodeURIComponent(url.pathname.slice(7)))));
+      if (p.startsWith('/media/')) {
+        // only files that are registered alerts: never other content of the media folder (notes, partial uploads)
+        const name = path.basename(decodeURIComponent(url.pathname.slice(7)));
+        const entry =
+          config.files.find(f => f.file === name) ||
+          config.files.find(f => f.file.toLowerCase() === name.toLowerCase());
+        if (!entry) return json(res, 404, { error: 'not found' });
+        return serveFile(req, res, path.join(MEDIA, entry.file));
+      }
       // ---- events: the Browser Source only ever receives {config(appearance), play, stop} ----
       if (p === '/events') {
         const role = url.searchParams.get('role') || 'overlay';
         if (!clients[role]) return json(res, 400, { error: 'bad role' });
+        // A page on another site can open an EventSource to this server; the browser cannot read the answer, but the
+        // connection alone would count as a Browser Source and consume alerts. Browsers send Origin (and Sec-Fetch-Site)
+        // on such a request, while our own pages, OBS and Meld are same-origin.
+        if (!originAllowed(req) || String(req.headers['sec-fetch-site'] || '').toLowerCase() === 'cross-site') {
+          log('warn', 'اتصال اورلی از یک صفحه‌ی خارجی رد شد', {
+            origin: String(req.headers.origin || '').slice(0, 100),
+            role
+          });
+          return json(res, 403, { error: 'forbidden origin' });
+        }
+        if (clients[role].size >= (LIMITS.sse[role] || 4)) {
+          log('warn', 'تعداد اتصال‌های هم‌زمان به صف رویدادها پر است', { role, open: clients[role].size });
+          return json(res, 429, { error: 'too many connections' });
+        }
         res.writeHead(200, {
           'Content-Type': 'text/event-stream',
           'Cache-Control': 'no-cache',
@@ -2147,6 +2466,71 @@ function createServer(opts) {
         sendState();
         return json(res, 200, { ok: true, streamer_id: config.streamer_id, secretStorage });
       }
+      if (p === '/api/se/setup' && req.method === 'POST') {
+        const body = await readJson(req);
+        const token = String(body.token || '').trim();
+        if (!seTokenOk(token))
+          return json(res, 400, {
+            error: 'توکن معتبر نیست. توکن JWT را از داشبورد StreamElements (Account → Channels → Show secrets) کپی کنید'
+          });
+        let me = null,
+          lastErr = null;
+        for (const px of await routesFor(SE_ME, true)) {
+          try {
+            const r = await httpsRequest(
+              SE_ME,
+              {
+                headers: { Authorization: 'Bearer ' + token, Accept: 'application/json', 'User-Agent': UA },
+                proxy: px
+              },
+              15000
+            );
+            if (r.status === 401 || r.status === 403) {
+              lastErr = new Error('rejected');
+              break;
+            }
+            if (r.status !== 200) throw new Error('HTTP ' + r.status);
+            me = JSON.parse(r.text);
+            break;
+          } catch (e) {
+            lastErr = e;
+          }
+        }
+        if (!me) {
+          const rejected = lastErr && lastErr.message === 'rejected';
+          return json(res, rejected ? 400 : 502, {
+            error: rejected
+              ? 'StreamElements این توکن را قبول نکرد؛ مطمئن شوید توکن JWT کامل و به‌روز است'
+              : 'اتصال به StreamElements ممکن نشد: ' + (lastErr ? lastErr.message : 'unknown')
+          });
+        }
+        const channelId = String(me._id || '').replace(/[^A-Za-z0-9]/g, '');
+        if (!channelId) return json(res, 400, { error: 'StreamElements شناسه‌ی کانال را برنگرداند' });
+        seDisconnect();
+        seToken = token;
+        config.se = {
+          channelId,
+          username: cleanText(me.username || me.displayName || '', 60) || null,
+          provider: cleanText(me.provider || '', 20) || null
+        };
+        saveConfig();
+        log('info', 'حساب StreamElements وصل شد', {
+          username: config.se.username,
+          provider: config.se.provider,
+          secretStorage
+        });
+        seConnect();
+        sendState();
+        return json(res, 200, { ok: true, username: config.se.username, provider: config.se.provider, secretStorage });
+      }
+      if (p === '/api/se/disconnect' && req.method === 'POST') {
+        seDisconnect();
+        approved = approved.filter(t => t.source !== 'streamelements');
+        saveConfig();
+        log('info', 'اتصال StreamElements حذف شد');
+        sendState();
+        return json(res, 200, { ok: true });
+      }
       if (p === '/api/disconnect-kickbot' && req.method === 'POST') {
         secret = '';
         config.streamer_id = null;
@@ -2241,10 +2625,11 @@ function createServer(opts) {
           data: DATA,
           secretStorage
         });
-        if (secret && secretStorage === 'os') saveConfig(); // migrates a legacy plaintext secret into the encrypted field
+        if ((secret || seToken) && secretStorage === 'os') saveConfig(); // migrates a legacy plaintext secret/token into the encrypted fields
         if (!(opts.testHooks && opts.testHooks.offline)) {
           // tests run fully offline
           connect();
+          seConnect();
           refreshRate(false);
           scheduleRate();
           if (config.kick.enabled && config.kick.channel)
@@ -2264,6 +2649,10 @@ function createServer(opts) {
     clearInterval(pulseTimer);
     clearInterval(kickPing);
     clearTimeout(reconnectTimer);
+    clearTimeout(seReconnectTimer);
+    try {
+      if (sews) sews.close();
+    } catch {}
     clearTimeout(nextTimer);
     clearTimeout(playTimeout);
     clearTimeout(playedSaveT);
@@ -2353,5 +2742,11 @@ module.exports = {
   isNetError,
   parsePacProxy,
   routeOrder,
-  describeKickFailure
+  describeKickFailure,
+  parseSeActivity,
+  seTokenOk,
+  fxFromBaha24,
+  fxFromBonbast,
+  sanitizeFx,
+  FX_CODES
 };

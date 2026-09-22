@@ -41,11 +41,13 @@ Please include:
 
 - [B3hnamR](https://github.com/B3hnamR) — independent review of 1.2.0 ([SahnePlusReview](https://github.com/B3hnamR/SahnePlusReview)) and a code audit of the 1.3.0 source that found the image-alert and capture-retry bugs fixed in 1.3.0.
 
+- [KernelDotDLL](https://github.com/KernelDotDLL) — reported (with reproductions) that any web page could open the Browser Source event stream and consume alerts, and that the media route served every file in the media folder; both fixed in 1.3.2.
+
 ## Scope
 
 In scope:
 
-- the local server on `127.0.0.1:7788` being reachable from another machine, from another origin in the browser (CSRF, DNS rebinding) or leaking the KickBot widget key;
+- the local server on `127.0.0.1:7788` being reachable from another machine, from another origin in the browser (CSRF, DNS rebinding) or leaking the KickBot widget key or the StreamElements token;
 - the Browser Source executing injected content from a donation name or message;
 - imported media files causing code execution or path traversal;
 - the Electron shell (IPC, preload bridge, navigation, permissions) and the installer doing anything not described in [PRIVACY.md](PRIVACY.md);
@@ -68,4 +70,5 @@ Honest current state, so nobody over-trusts a release:
 | Signed checksums (GPG / minisign) | **not yet** |
 | Reproducible builds | **not verified** — electron-builder output is not guaranteed bit-for-bit reproducible |
 | Updates | **update check + one-click update since 1.3.1** — the app checks this repository's latest release (can be turned off); an update is downloaded only after the user clicks, verified against the release's `SHA256SUMS.txt` and installed with the official installer. Never silent or automatic. The checksum comes from the same release, so authenticity rests on this GitHub account (protected with two-factor authentication); the installer is not code-signed |
+| Electron fuses / debug switches | **locked down** — `RunAsNode`, `NODE_OPTIONS` and `--inspect` are disabled by fuses, the asar archive is integrity-checked, and since 1.3.3 the installed app strips Chromium's `--remote-debugging-*` switches at startup, so it cannot be driven over the DevTools protocol |
 | Runtime npm dependencies | **none** — only Node built-ins and Electron |
